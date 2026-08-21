@@ -39,21 +39,16 @@ def make_flags(args: argparse.Namespace) -> argparse.Namespace:
     angle_y = [value for value in angle for _ in range(args.grid_size)]
     x = np.linspace(-(args.nx * px) / 2, (args.nx * px) / 2, args.nx + 1)
     y = np.linspace(-(args.nx * py) / 2, (args.nx * py) / 2, args.nx + 1)
-    total_cases = args.grid_size**2
-
     return argparse.Namespace(
         optim="Adam",
         train_step=args.train_steps,
         lr=40e-3,
         lr_decay_rate=0.8,
-        stop_threshold=1e-6,
-        test_case=2,
         data_dir=str(args.target_dir),
         function="AS",
         Nx=args.nx,
         Ny=args.nx,
         wavelength=[0.785e-6],
-        wavelength_copy=[0.785e-6],
         ratio=0.3,
         x=x,
         y=y,
@@ -63,18 +58,9 @@ def make_flags(args: argparse.Namespace) -> argparse.Namespace:
         distance=[200e-6, 600e-6],
         NA=None,
         eta=2,
-        topology_vortex=[0],
-        Angle_x=angle_x,
-        Angle_y=angle_y,
-        accumulation_steps=(total_cases + args.grid_size - 1) // args.grid_size,
-        batch_size_per_gpu=args.grid_size,
-        max_rotation_angle=0.0,
-        max_distance_error=0.0,
-        max_angle_error=0.0,
-        rotation_error_mode="batch",
-        distance_error_mode="batch",
-        angle_error_mode="sample",
-        deta_angle=angle_degree,
+        angle_x=angle_x,
+        angle_y=angle_y,
+        batch_size=args.grid_size,
     )
 
 

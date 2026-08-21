@@ -1,16 +1,10 @@
 import torch
 import numpy as np
-from torch.fft import fft2, fftshift, ifft2
-from torch.nn.functional import relu
 from torch.optim import lr_scheduler
 from torch import nn
-import torch.nn.functional as F
-import time
 import cv2
 import os
-from PIL import Image
 import random
-import itertools
 from field_propagation import Field_propagation
 
 # torch.set_default_dtype(torch.float64)
@@ -22,23 +16,9 @@ class Core(Field_propagation):
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device=device
 
-        # Pair the x and y incidence angles.
-        # zip groups corresponding entries from the two angle lists.
-        # e.g., [(-20, -20), (0, 0), (20, 20)]
-        angle_pairs = list(zip(self.flags.Angle_x, self.flags.Angle_y))
-
-        # Read the topological-charge list.
-        topos = self.flags.topology_vortex
-
-        # Form the Cartesian product of angle pairs and topological charges.
-        #    e.g., [ ((-20, -20), -6), ((-20, -20), -3), ..., ((20, 20), 6) ]
-        self.case_configs = list(itertools.product(angle_pairs, topos))
-
-        # Flatten every configuration to (angle_x, angle_y, topological_charge).
-        self.case_configs = [
-            (angle_pair[0], angle_pair[1], topo)
-            for angle_pair, topo in self.case_configs
-        ]
+        if len(self.flags.angle_x) != len(self.flags.angle_y):
+            raise ValueError("angle_x and angle_y must have the same length.")
+        self.case_configs = list(zip(self.flags.angle_x, self.flags.angle_y))
 
 
 
@@ -66,74 +46,12 @@ class Core(Field_propagation):
                                               patience=100, threshold=1e-2)
 
 
-    def rotate_complex_field(self, field, angle_deg):
-        """
-        Rotate a complex field about its physical center using differentiable PyTorch interpolation.
-        field: complex tensor with shape (Batch, Nx, Ny) or (Batch, C, Nx, Ny)
-        angle_deg: rotation angle in degrees
-        """
-        original_shape = field.shape
-        # Reshape to the four-dimensional (N, C, H, W) layout required by F.grid_sample.
-        # Flatten all leading dimensions into the batch dimension.
-        field_4d = field.view(-1, 1, field.shape[-2], field.shape[-1])
-        N, C, H, W = field_4d.shape
-
-        angle_rad = angle_deg * np.pi / 180.0
-        cos_a = np.cos(angle_rad)
-        sin_a = np.sin(angle_rad)
-
-        # Build the 2 x 3 affine transformation matrix.
-        # [cos(a), -sin(a), 0]
-        # [sin(a),  cos(a), 0]
-        theta_mat = torch.tensor([
-            [cos_a, -sin_a, 0.0],
-            [sin_a, cos_a, 0.0]
-        ], dtype=torch.float32, device=field.device)
-
-        # Expand the transform over the batch dimension.
-        theta_mat = theta_mat.unsqueeze(0).repeat(N, 1, 1)
-
-        # Generate the sampling grid.
-        grid = F.affine_grid(theta_mat, size=(N, C, H, W), align_corners=False)
-
-        # Interpolate real and imaginary parts separately for compatibility and stability.
-        # padding_mode='zeros' applies an absorbing boundary outside the field.
-        field_real = field_4d.real.float()
-        field_imag = field_4d.imag.float()
-
-        out_real = F.grid_sample(field_real, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-        out_imag = F.grid_sample(field_imag, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-
-        # Recombine the complex field and restore the original shape.
-        out_complex = torch.complex(out_real, out_imag).to(field.dtype)
-        return out_complex.view(original_shape)
-
-    def model(self, micro_batch_configs, apply_random_rotation=False, specific_rotation=0.0,
-              apply_random_distance_error=False, apply_random_angle_error=False,
-              rotation_error_mode='batch', distance_error_mode='batch', angle_error_mode='sample'):
-        # Rotation, distance, and angle errors can be shared by a batch or sampled independently.
-
+    def model(self, micro_batch_configs):
         ms_value = self.MS_property
         Num_layer = len(ms_value)
-        Num_wave = len(self.flags.wavelength)
         batch_size = len(micro_batch_configs)
 
-        # Incidence-angle error: shared by a batch or sampled independently.
-        if apply_random_angle_error and hasattr(self.flags, 'max_angle_error') and self.flags.max_angle_error > 0:
-            if angle_error_mode == 'batch':
-                angle_noise_x = (torch.rand(1, device=self.device).item() * 2 - 1) * self.flags.max_angle_error
-                angle_noise_y = (torch.rand(1, device=self.device).item() * 2 - 1) * self.flags.max_angle_error
-                perturbed_configs = [(cfg[0] + angle_noise_x, cfg[1] + angle_noise_y, cfg[2]) for cfg in micro_batch_configs]
-            else:
-                angle_noise_x = (torch.rand(batch_size, device=self.device) * 2 - 1) * self.flags.max_angle_error
-                angle_noise_y = (torch.rand(batch_size, device=self.device) * 2 - 1) * self.flags.max_angle_error
-                perturbed_configs = []
-                for cfg, dx, dy in zip(micro_batch_configs, angle_noise_x.tolist(), angle_noise_y.tolist()):
-                    perturbed_configs.append((cfg[0] + dx, cfg[1] + dy, cfg[2]))
-        else:
-            perturbed_configs = micro_batch_configs
-
-        Inc, wavelength = self.Angle_phase_multiple_vortex(perturbed_configs)
+        Inc, wavelength = self.angle_phase(micro_batch_configs)
         J_total = Inc
 
         # First metasurface layer and gap propagation.
@@ -141,40 +59,12 @@ class Core(Field_propagation):
         MS_0 = MS_0.repeat(batch_size, 1, 1)
         J_total_inter = MS_0 * J_total
 
-        distance_0 = self.flags.distance[0]
-        if apply_random_distance_error and hasattr(self.flags, 'max_distance_error') and self.flags.max_distance_error > 0:
-            if distance_error_mode == 'batch':
-                distance_0 = distance_0 + (torch.rand(1).item() * 2 - 1) * self.flags.max_distance_error
-            else:
-                distance_0 = distance_0 + (torch.rand(batch_size, device=self.device) * 2 - 1) * self.flags.max_distance_error
-
-        J_total = self.func(J_total_inter, wavelength, distance_0, self.flags.refractive_index[0])
-
-        self.field_on_second_layer = J_total
-        # Field rotation.
-        # Apply a random robustness rotation during training when requested.
-        if apply_random_rotation and hasattr(self.flags, 'max_rotation_angle'):
-            if rotation_error_mode == 'batch':
-                # Draw a uniform random angle from [-max_angle, max_angle].
-                theta = (torch.rand(1).item() * 2 - 1) * self.flags.max_rotation_angle
-                if theta != 0.0:
-                    J_total = self.rotate_complex_field(J_total, theta)
-            else:
-                theta = (torch.rand(batch_size, device=self.device) * 2 - 1) * self.flags.max_rotation_angle
-                J_total_list = []
-                for idx in range(batch_size):
-                    theta_i = theta[idx].item()
-                    J_i = J_total[idx:idx + 1]
-                    if theta_i != 0.0:
-                        J_i = self.rotate_complex_field(J_i, theta_i)
-                    J_total_list.append(J_i)
-                J_total = torch.cat(J_total_list, dim=0)
-        else:
-            # Use the specified angle during evaluation or testing.
-            theta = specific_rotation
-            # Rotate the field before the second layer when the requested angle is nonzero.
-            if theta != 0.0:
-                J_total = self.rotate_complex_field(J_total, theta)
+        J_total = self.func(
+            J_total_inter,
+            wavelength,
+            self.flags.distance[0],
+            self.flags.refractive_index[0],
+        )
 
         # Second metasurface layer and propagation to the hologram plane.
         if Num_layer > 1:
@@ -205,15 +95,12 @@ class Core(Field_propagation):
         return X,Y
 
 
-    def Angle_phase_multiple_vortex(self, micro_batch_configs):
-        # micro_batch_configs: [ (ax1, ay1, t1), (ax2, ay2, t2), ... ]
-
+    def angle_phase(self, micro_batch_configs):
         batch_size = len(micro_batch_configs)
         Num_wave=len(self.flags.wavelength)
-        # Extract x angles, y angles, and topological charges.
+        # Extract x and y incidence angles.
         angles_x_in_batch = [config[0] for config in micro_batch_configs]
         angles_y_in_batch = [config[1] for config in micro_batch_configs]
-        topos_in_batch = [config[2] for config in micro_batch_configs]
 
         # Generate the incidence-angle phase.
         wavelength_tensor = self.build_tensor(self.flags.wavelength)[:, None, None]
@@ -223,7 +110,6 @@ class Core(Field_propagation):
         angles_y_rad = np.pi / 180 * self.build_tensor(angles_y_in_batch)[:, None, None]
 
         X,Y=self.XY_generation()
-        phy = torch.atan2(Y, X)
 
 
         # Use broadcasting over cases and wavelengths.
@@ -236,48 +122,18 @@ class Core(Field_propagation):
 
         # X, Y: (Nx, Ny)
         # The incident phase now includes both x and y angle components.
-        Inc_angle = torch.exp(1j * k_b * (torch.sin(angles_x_rad_b) * X + torch.sin(angles_y_rad_b) * Y))
-        # Inc_angle represents the batched angular phase.
-
-        # Generate the vortex phase.
-        topos_tensor = self.build_tensor(topos_in_batch)[:, None, None]  # (batch_size, 1, 1)
-        topos_tensor =torch.repeat_interleave(topos_tensor,Num_wave,dim=0)
-        Inc_vortex = torch.exp(1j * topos_tensor * phy)  # (batch_size, Nx, Ny)
-
-        # Combine angular and vortex phases.
-        Inc = Inc_angle * Inc_vortex
+        incident_field = torch.exp(
+            1j * k_b * (torch.sin(angles_x_rad_b) * X + torch.sin(angles_y_rad_b) * Y)
+        )
 
         wavelength = self.flags.wavelength * batch_size
 
-        return Inc, wavelength
+        return incident_field, wavelength
 
 
 
-    def make_loss(self, logit=None, labels=None, G=None, iter=0):
-        if logit is None:
-            return None
-
-        mseloss = nn.MSELoss()
-
-        eta=self.flags.eta
-
-        # fujia=self.dirac_image()
-        fujia=1
-        MSE_loss = mseloss(fujia*logit, fujia*eta * labels)
-
-        BDY_loss = 0
-
-        # bb=torch.mean(torch.topk(torch.abs(self.field_on_second_layer[0]).flatten(), 30).values)
-        # BDY_loss = relu(bb-15)/20
-        # Image_NA_1=self.Gaussian_filter(torch.exp(1j * 2 * np.pi * self.MS_property[0][0]), self.flags.x, self.flags.y, self.flags.wavelength, 1.0)
-        # Image_NA_2 = self.Gaussian_filter(torch.exp(1j * 2 * np.pi * self.MS_property[0][0]), self.flags.x,
-        #                                   self.flags.y, self.flags.wavelength, 0.2)
-        #
-        # BDY_loss=torch.mean((torch.abs(Image_NA_1)**2-torch.abs(Image_NA_2)**2))/torch.mean(torch.abs(Image_NA_1)**2)*0.1
-
-        if G is not None:  # This is using the boundary loss
-            BDY_loss = G
-        return torch.add(MSE_loss, BDY_loss)
+    def make_loss(self, logit, labels):
+        return nn.MSELoss()(logit, self.flags.eta * labels)
 
     def read_figure(self):
 
@@ -305,14 +161,11 @@ class Core(Field_propagation):
         x1 = int((1 - ratio) / 2 * Nx_ob)
         y1 = int((1 - ratio) / 2 * Ny_ob)
 
-        Num_topo = len(self.flags.topology_vortex)
         Num_wave = len(self.flags.wavelength)
-        Num_angles = len(self.flags.Angle_x)  # Total number of angle pairs.
-
-        total_cases = Num_wave * Num_topo * Num_angles
+        total_cases = Num_wave * len(self.case_configs)
 
 
-        image_t = None  # Accumulated target-image tensor.
+        images = []
 
         for i in range(total_cases):
             # Read the target image for this case.
@@ -336,14 +189,9 @@ class Core(Field_propagation):
 
             image0 = np.zeros([Nx_ob, Ny_ob])
             image0[x1:x1 + nxx, y1:y1 + nyy] = image
-            image = image0[np.newaxis, :, :]
+            images.append(image0)
 
-            if i == 0:
-                image_t = image
-            else:
-                image_t = np.concatenate([image_t, image], axis=0)
-
-        result = self.build_tensor(image_t)
+        result = self.build_tensor(np.stack(images, axis=0))
         return result
 
     def ratio_image(self,image):
@@ -374,13 +222,6 @@ class Core(Field_propagation):
 
     def train(self):
 
-        # self.load()  # load the model as constructed
-        # cuda = True if torch.cuda.is_available() else False
-        # if cuda:
-        #     self.model_NN.cuda()
-        #
-        # self.model_NN.eval()
-
         # Initialize the geometry_eval or the initial guess xs
         self.initialize_metasurface()
         # Set up the learning schedule and optimizer
@@ -392,18 +233,20 @@ class Core(Field_propagation):
         self.save_loss = []
 
         # Split the label tensor by case, preserving the order in self.case_configs.
-        num_output_channels_per_case = labels.shape[0] // len(self.case_configs)
         labels_per_case = torch.chunk(labels, len(self.case_configs), dim=0)
+        num_micro_batches = (
+            len(self.case_configs) + self.flags.batch_size - 1
+        ) // self.flags.batch_size
 
         for epoch in range(self.flags.train_step):
             self.optm_eval.zero_grad()
             total_loss_value = 0.0
 
             # Gradient-accumulation loop; each iteration processes one micro-batch.
-            for i in range(self.flags.accumulation_steps):
+            for i in range(num_micro_batches):
                 # Slice configurations and labels for the current micro-batch.
-                start = i * self.flags.batch_size_per_gpu
-                end = start + self.flags.batch_size_per_gpu
+                start = i * self.flags.batch_size
+                end = start + self.flags.batch_size
 
                 micro_batch_configs = self.case_configs[start:end]
                 if not micro_batch_configs: continue  # Skip an empty final micro-batch.
@@ -412,20 +255,11 @@ class Core(Field_propagation):
                 micro_batch_labels = torch.cat(micro_batch_labels_list, dim=0)
 
                 # Forward propagation.
-                logit = self.model(
-                    micro_batch_configs=micro_batch_configs,
-                    apply_random_rotation=True,
-                    apply_random_distance_error=True,
-                    apply_random_angle_error=True,
-                    rotation_error_mode=getattr(self.flags, 'rotation_error_mode', 'batch'),
-                    distance_error_mode=getattr(self.flags, 'distance_error_mode', 'batch'),
-                    angle_error_mode=getattr(self.flags, 'angle_error_mode', 'sample'),
-                )
+                logit = self.model(micro_batch_configs)
                 logit = torch.abs(logit) ** 2
 
                 # Compute the loss.
-                # B_loss =self.loss_constraint()
-                loss = self.make_loss(logit, micro_batch_labels, G=None, iter=epoch)/ self.flags.accumulation_steps
+                loss = self.make_loss(logit, micro_batch_labels) / num_micro_batches
 
                 # Backpropagate the accumulated loss.
                 loss.backward()
@@ -448,27 +282,17 @@ class Core(Field_propagation):
         # Disable gradient tracking during final evaluation.
         with torch.no_grad():
             # Determine the number of micro-batches needed to cover every case.
-            num_micro_batches = (len(self.case_configs) + self.flags.batch_size_per_gpu - 1) // self.flags.batch_size_per_gpu
-
             for i in range(num_micro_batches):
                 # Slice the current micro-batch configurations.
-                start = i * self.flags.batch_size_per_gpu
-                end = start + self.flags.batch_size_per_gpu
+                start = i * self.flags.batch_size
+                end = start + self.flags.batch_size
 
                 micro_batch_configs = self.case_configs[start:end]
                 if not micro_batch_configs:
                     continue  # Skip an empty final micro-batch.
 
                 # Forward propagation.
-                logit_batch = self.model(
-                    micro_batch_configs=micro_batch_configs,
-                    apply_random_rotation=False,
-                    apply_random_distance_error=False,
-                    apply_random_angle_error=False,
-                    rotation_error_mode=getattr(self.flags, 'rotation_error_mode', 'batch'),
-                    distance_error_mode=getattr(self.flags, 'distance_error_mode', 'batch'),
-                    angle_error_mode=getattr(self.flags, 'angle_error_mode', 'sample'),
-                )
+                logit_batch = self.model(micro_batch_configs)
                 logit_batch = torch.abs(logit_batch) ** 2
 
                 # Append the current batch output.
@@ -495,29 +319,10 @@ class Core(Field_propagation):
         output = []
         for i in range(0, Number_ms):
             phy = torch.full([1,self.flags.Nx, self.flags.Ny], random.random())
-            # phy = torch.rand([1, self.flags.Nx, self.flags.Ny])
             phy=self.build_tensor(phy,requires_grad=True)
             layer = [phy]
             output += layer
         self.MS_property = output
-
-    def loss_constraint(self):
-        relu = torch.nn.ReLU()
-
-        size = len(self.MS_property)
-        BDY_loss = 0
-        for i in range(0, size):
-            Wx_Wy_theta = self.MS_property[i]
-            W_x = Wx_Wy_theta[0, :, :]
-            W_y = Wx_Wy_theta[1, :, :]
-            Theta = Wx_Wy_theta[2, :, :]
-            BDY_loss_all = relu(W_x - 0.9) + relu(-W_x) + relu(W_y - 0.9) + relu(
-                -W_y)  # ensure W_x W_y is between 0 and 1
-            BDY_loss = BDY_loss + 5 * torch.mean(BDY_loss_all)
-
-        return BDY_loss
-
-
 
     def calculate_confusion_matrix_torch(self,design_images, measured_images, threshold=0.3):
         """
@@ -550,7 +355,7 @@ class Core(Field_propagation):
         if design_images.shape != measured_images.shape:
             raise ValueError("design_images and measured_images must have identical shapes.")
 
-        N, H, W = design_images.shape
+        N = design_images.shape[0]
         device = design_images.device
         dtype = measured_images.dtype
         epsilon = 1e-12
@@ -559,9 +364,7 @@ class Core(Field_propagation):
             return torch.empty((0, 0), device=device, dtype=dtype), 0.0
 
         # Build binary target masks T.
-        # T_bool: (N, H, W)
         T_bool = design_images > threshold
-        T_float = T_bool.to(dtype=dtype)
 
         # Denominator: total energy in each reconstructed image.
         total_energy = measured_images.sum(dim=(1, 2))  # Shape: (N,)

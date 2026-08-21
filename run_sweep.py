@@ -49,23 +49,16 @@ def make_flags(
 
     x = np.linspace(-(nx * px) / 2, (nx * px) / 2, nx + 1)
     y = np.linspace(-(nx * py) / 2, (nx * py) / 2, nx + 1)
-    batch_size = n
-    accumulation_steps = (n + batch_size - 1) // batch_size
-
     return argparse.Namespace(
-        deta_angle=angle_degree,
-        N=n,
         optim="Adam",
         train_step=train_steps,
         lr=30e-3,
         lr_decay_rate=0.8,
-        stop_threshold=1e-6,
         data_dir=str(target_dir),
         function="AS",
         Nx=nx,
         Ny=nx,
         wavelength=[0.785e-6],
-        wavelength_copy=[0.785e-6],
         ratio=0.5,
         x=x,
         y=y,
@@ -75,19 +68,9 @@ def make_flags(
         distance=[200e-6, 450e-6],
         NA=None,
         eta=3,
-        P_gap=6e-6,
-        radius=0.4e-6,
-        topology_vortex=[0],
-        Angle_x=angle_x,
-        Angle_y=angle_y,
-        accumulation_steps=accumulation_steps,
-        batch_size_per_gpu=batch_size,
-        max_rotation_angle=0.0,
-        max_distance_error=0.0,
-        max_angle_error=0.0,
-        rotation_error_mode="batch",
-        distance_error_mode="batch",
-        angle_error_mode="sample",
+        angle_x=angle_x,
+        angle_y=angle_y,
+        batch_size=n,
     )
 
 
@@ -117,7 +100,7 @@ def main() -> None:
 
             results.append(
                 {
-                    "deta_angle": flags.deta_angle,
+                    "deta_angle": angle_mrad * 1e-3 * 180.0 / np.pi,
                     "deta_angle_mrad": angle_mrad,
                     "N": n,
                     "crosstalk_average": float(simulation.crosstalk_average.detach().cpu()),
