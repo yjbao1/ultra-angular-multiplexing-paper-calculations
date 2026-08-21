@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+results/
+paper_figures/*.svg
+
+# The parent research repository ignores all BMP/MAT files. These small inputs
+# are required for this standalone package and must remain versioned.
+!targets/*.bmp
+!reference_data/*.mat
